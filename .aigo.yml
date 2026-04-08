@@ -1,0 +1,18 @@
+version: 1
+model: "claude-sonnet-4-6"
+auto_respond: true        # auto-respond to PR comments (set false to require /aigo-* commands)
+max_retries: 2            # max CI fix / review fix attempts per PR
+max_responses: 5          # max review response rounds per PR
+# language: "en"          # output language for skill responses (e.g. ko, en, ja)
+# branch_prefix: "aigo"   # branch name prefix (aigo/issue-42-...)
+# review:
+#   model: ""             # separate model for independent review (default: same as model)
+#   instructions: ""      # custom review instructions (e.g. "focus on security and SQL injection")
+#   fix_grade: "CRITICAL,HIGH,MEDIUM,LOW"  # severities to auto-fix (e.g. "CRITICAL,HIGH", "none" to disable)
+# commands:
+#   build: ""
+#   test: ""
+#   lint: ""
+# escalation:
+#   label: "aigo:needs-human"
+#   slack_webhook: ""

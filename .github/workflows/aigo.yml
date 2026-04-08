@@ -1,0 +1,315 @@
+# aigo - Main Workflow Template
+#
+# Copy this file to `.github/workflows/aigo.yml` in the target repo.
+#
+# Required setup:
+#   - aigo cloned at $HOME/.aigo/aigo/
+#     (git clone git@github.com:youngrok-XCENA/aigo.git ~/.aigo/aigo)
+#
+# Optional:
+#   - .aigo.yml in repo root for custom configuration
+#   - CLAUDE.md in repo root for build/test instructions
+
+name: aigo
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  check_suite:
+    types: [completed]
+  pull_request:
+    types: [closed]
+
+concurrency:
+  group: aigo-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_suite.head_branch || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  aigo:
+    runs-on: [self-hosted, aigo]
+    timeout-minutes: 60
+
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      checks: read
+      actions: read
+
+    # Only run for aigo-related events
+    if: >-
+      (
+        github.event_name == 'issues'
+        && github.event.action == 'labeled'
+        && github.event.label.name == 'aigo'
+      )
+      || (
+        github.event_name == 'issue_comment'
+        && github.event.action == 'created'
+        && !contains(github.event.comment.body, '<!-- aigo -->')
+        && (
+          (
+            github.event.comment.user.type != 'Bot'
+            && (
+              startsWith(github.event.comment.body, '/aigo-')
+              || (
+                github.event.issue.pull_request
+                && contains(github.event.issue.labels.*.name, 'aigo')
+              )
+            )
+          )
+          || (
+            contains(github.event.comment.body, '<!-- aigo:trigger -->')
+            && startsWith(github.event.comment.body, '/aigo-')
+          )
+        )
+      )
+      || (
+        github.event_name == 'pull_request_review'
+        && github.event.action == 'submitted'
+        && !contains(github.event.review.body, '<!-- aigo -->')
+        && github.event.review.user.type != 'Bot'
+        && startsWith(github.event.pull_request.head.ref, 'aigo/')
+      )
+      || (
+        github.event_name == 'check_suite'
+        && github.event.action == 'completed'
+        && github.event.check_suite.conclusion == 'failure'
+        && startsWith(github.event.check_suite.head_branch, 'aigo/')
+      )
+      || (
+        github.event_name == 'pull_request'
+        && github.event.action == 'closed'
+        && startsWith(github.event.pull_request.head.ref, 'aigo/')
+      )
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Update aigo
+        run: git -C "$HOME/.aigo/aigo" pull --quiet || true
+
+      - name: Setup Claude Code
+        run: |
+          if ! command -v claude &> /dev/null; then
+            npm install -g @anthropic-ai/claude-code
+          fi
+
+      - name: Determine event context
+        id: context
+        run: |
+          # Extract issue/PR number depending on event type
+          if [[ "${{ github.event_name }}" == "issues" ]]; then
+            echo "issue_number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+            echo "pr_number=" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            echo "issue_number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+            if [[ -n "${{ github.event.issue.pull_request }}" ]]; then
+              echo "pr_number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+            else
+              echo "pr_number=" >> "$GITHUB_OUTPUT"
+            fi
+          elif [[ "${{ github.event_name }}" == "pull_request_review" ]]; then
+            echo "issue_number=" >> "$GITHUB_OUTPUT"
+            echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "check_suite" ]]; then
+            echo "issue_number=" >> "$GITHUB_OUTPUT"
+            # Find PR number from the branch
+            PR_NUM=$(gh pr list --head "${{ github.event.check_suite.head_branch }}" --json number -q '.[0].number' 2>/dev/null || echo "")
+            echo "pr_number=${PR_NUM}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "issue_number=" >> "$GITHUB_OUTPUT"
+            echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Route event to skill
+        id: route
+        run: |
+          PLUGIN_DIR="$HOME/.aigo/aigo"
+          source "$PLUGIN_DIR/lib/route.sh"
+
+          SKILL=$(route_event "$GITHUB_EVENT_NAME" "$GITHUB_EVENT_PATH")
+
+          # check_suite self-trigger filter: skip if failed workflow is aigo itself
+          if [[ "$GITHUB_EVENT_NAME" == "check_suite" ]]; then
+            PR_BRANCH=$(jq -r '.check_suite.head_branch' "$GITHUB_EVENT_PATH")
+            FAILED_WORKFLOW=$(gh run list --branch "$PR_BRANCH" --status failure \
+              --limit 1 --json workflowName -q '.[0].workflowName' 2>/dev/null || echo "")
+            if [[ "$FAILED_WORKFLOW" == "aigo" ]]; then
+              echo "Ignoring aigo workflow's own CI failure on $PR_BRANCH"
+              SKILL=""
+            fi
+          fi
+
+          # Merged PR -- close linked issue directly, no LLM needed
+          if [[ "$SKILL" == "__pr_merged__" ]]; then
+            PR_BODY=$(jq -r '.pull_request.body // empty' "$GITHUB_EVENT_PATH")
+            PR_TITLE=$(jq -r '.pull_request.title' "$GITHUB_EVENT_PATH")
+            PR_NUM=$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")
+            ISSUE_NUM=$(echo "$PR_BODY" | grep -oP '(?:Closes|Fixes|Resolves)\s+#\K\d+' | head -1)
+            if [[ -n "$ISSUE_NUM" ]]; then
+              gh issue comment "$ISSUE_NUM" --body "$(printf '## Completed\n\nPR #%s (%s) has been merged. Closing this issue.\n\n<!-- aigo -->' "$PR_NUM" "$PR_TITLE")"
+              gh issue close "$ISSUE_NUM"
+            fi
+            SKILL=""
+          fi
+
+          # Abandoned PR -- no action taken.
+          # aigo cannot distinguish intentional close from cleanup/E2E teardown.
+          # Branch deletion is too destructive; comment is noise when the user
+          # closed the PR themselves. State machine handles recovery naturally
+          # if the issue still has the aigo label.
+          if [[ "$SKILL" == "__pr_abandoned__" ]]; then
+            SKILL=""
+          fi
+
+          echo "skill=$SKILL" >> "$GITHUB_OUTPUT"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+          PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+
+      - name: Disable plugins for clean skill execution
+        run: |
+          SETTINGS="$HOME/.claude/settings.json"
+          if [[ -f "$SETTINGS" ]]; then
+            cp "$SETTINGS" "${SETTINGS}.aigo-backup"
+            jq '.enabledPlugins = {}' "$SETTINGS" > "${SETTINGS}.tmp" && mv "${SETTINGS}.tmp" "$SETTINGS"
+          fi
+
+      - name: Run state loop
+        if: github.event_name == 'issues'
+        run: |
+          PLUGIN_DIR="$HOME/.aigo/aigo"
+          source "$PLUGIN_DIR/lib/state.sh"
+          source "$PLUGIN_DIR/lib/orchestrator.sh"
+          source "$PLUGIN_DIR/lib/loop.sh"
+
+          # Read model from base branch .aigo.yml (default: claude-sonnet-4-6)
+          DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef -q '.defaultBranchRef.name')
+          AIGO_MODEL=$(git show "origin/$DEFAULT_BRANCH:.aigo.yml" 2>/dev/null \
+            | yq -r '.model // "claude-sonnet-4-6"' 2>/dev/null || echo "claude-sonnet-4-6")
+
+          run_state_loop "$ISSUE_NUMBER" "$PR_NUMBER" "$AIGO_MODEL"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+          PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+          DISABLE_OMC: "1"
+          AIGO_DRY_RUN: ${{ vars.AIGO_DRY_RUN || '0' }}
+
+      - name: Run event routing
+        if: github.event_name != 'issues' && steps.route.outputs.skill != '' && steps.route.outputs.skill != '__pr_merged__' && steps.route.outputs.skill != '__pr_abandoned__'
+        run: |
+          PLUGIN_DIR="$HOME/.aigo/aigo"
+          source "$PLUGIN_DIR/lib/state.sh"
+          source "$PLUGIN_DIR/lib/orchestrator.sh"
+          source "$PLUGIN_DIR/lib/config.sh"
+
+          # Read model from base branch .aigo.yml (default: claude-sonnet-4-6)
+          DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef -q '.defaultBranchRef.name')
+          AIGO_CONFIG_RAW=$(git show "origin/$DEFAULT_BRANCH:.aigo.yml" 2>/dev/null || echo "")
+          AIGO_MODEL=$(echo "$AIGO_CONFIG_RAW" | yq -r '.model // "claude-sonnet-4-6"' 2>/dev/null || echo "claude-sonnet-4-6")
+
+          SKILL="${{ steps.route.outputs.skill }}"
+
+          # Review uses a separate model for independent verification
+          if [[ "$SKILL" == "review" ]]; then
+            SKILL_MODEL=$(echo "$AIGO_CONFIG_RAW" | yq -r '.review.model // "'"$AIGO_MODEL"'"' 2>/dev/null || echo "$AIGO_MODEL")
+          else
+            SKILL_MODEL="$AIGO_MODEL"
+          fi
+
+          # Escalation guard: skip if already escalated
+          if [[ -n "$PR_NUMBER" ]]; then
+            ESCALATED=$(gh pr view "$PR_NUMBER" --json labels -q '.labels[].name' 2>/dev/null | grep -c 'aigo:needs-human' || true)
+            if [[ "$ESCALATED" -gt 0 ]]; then
+              echo "Issue is escalated (aigo:needs-human label), skipping $SKILL"
+              exit 0
+            fi
+          elif [[ -n "$ISSUE_NUMBER" ]]; then
+            ESCALATED=$(gh issue view "$ISSUE_NUMBER" --json labels -q '.labels[].name' 2>/dev/null | grep -c 'aigo:needs-human' || true)
+            if [[ "$ESCALATED" -gt 0 ]]; then
+              echo "Issue is escalated (aigo:needs-human label), skipping $SKILL"
+              exit 0
+            fi
+          fi
+
+          # Per-skill limit enforcement
+          if [[ -n "$PR_NUMBER" ]]; then
+            AIGO_CONFIG=$(_read_aigo_config)
+            if [[ "$SKILL" == "fix-ci" ]]; then
+              CI_COUNT=$(count_ci_fix_attempts "$PR_NUMBER")
+              MAX_RETRIES=$(_config_field "$AIGO_CONFIG" '.max_retries' '3')
+              if [[ "$CI_COUNT" -ge "$MAX_RETRIES" ]]; then
+                echo "CI fix limit reached ($CI_COUNT/$MAX_RETRIES), escalating"
+                ESCALATE_MSG="Status: escalate"
+                ESCALATE_MSG+=$'\n'"Reason: ci_retries_exceeded"
+                ESCALATE_MSG+=$'\n'"Detail: CI fix attempted $CI_COUNT times (limit: $MAX_RETRIES)"
+                ESCALATE_MSG+=$'\n'"Human input needed: Please review CI failures and fix manually"
+                ESCALATE_MSG+=$'\n'"Attempted: $CI_COUNT automated fix attempts"
+                _handle_escalate_output "$ISSUE_NUMBER" "$PR_NUMBER" "$ESCALATE_MSG"
+                exit 0
+              fi
+            fi
+            if [[ "$SKILL" == "respond" ]]; then
+              RESP_COUNT=$(count_review_responses "$PR_NUMBER")
+              MAX_RESPONSES=$(_config_field "$AIGO_CONFIG" '.max_responses' '5')
+              if [[ "$RESP_COUNT" -ge "$MAX_RESPONSES" ]]; then
+                echo "Review response limit reached ($RESP_COUNT/$MAX_RESPONSES), escalating"
+                ESCALATE_MSG="Status: escalate"
+                ESCALATE_MSG+=$'\n'"Reason: review_response_limit_exceeded"
+                ESCALATE_MSG+=$'\n'"Detail: Review response limit ($MAX_RESPONSES) exceeded"
+                ESCALATE_MSG+=$'\n'"Human input needed: Please resolve remaining review feedback manually"
+                ESCALATE_MSG+=$'\n'"Attempted: $RESP_COUNT automated response rounds"
+                _handle_escalate_output "$ISSUE_NUMBER" "$PR_NUMBER" "$ESCALATE_MSG"
+                exit 0
+              fi
+            fi
+          fi
+
+          # CI first principle: if respond/rebase and CI is failing, run fix-ci first
+          # Respects fix-ci limit — skip if already at max_retries
+          if [[ "$SKILL" == "respond" || "$SKILL" == "rebase" ]]; then
+            if [[ -n "$PR_NUMBER" ]]; then
+              CI_CHECKS=$(gh pr checks "$PR_NUMBER" 2>/dev/null || true)
+              if echo "$CI_CHECKS" | grep -qi "fail"; then
+                CI_FIX_COUNT=$(count_ci_fix_attempts "$PR_NUMBER")
+                CI_MAX=$(_config_field "$AIGO_CONFIG" '.max_retries' '3')
+                if [[ "$CI_FIX_COUNT" -lt "$CI_MAX" ]]; then
+                  PR_BRANCH=$(gh pr view "$PR_NUMBER" --json headRefName -q '.headRefName' 2>/dev/null || echo "")
+                  FAILED_WF=$(gh run list --branch "$PR_BRANCH" --status failure --limit 1 --json workflowName -q '.[0].workflowName' 2>/dev/null || echo "")
+                  if [[ "$FAILED_WF" != "aigo" ]]; then
+                    run_orchestrated_skill "fix-ci" "$ISSUE_NUMBER" "$PR_NUMBER" "$AIGO_MODEL"
+                  fi
+                fi
+              fi
+            fi
+          fi
+
+          run_orchestrated_skill "$SKILL" "$ISSUE_NUMBER" "$PR_NUMBER" "$SKILL_MODEL"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+          PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+          DISABLE_OMC: "1"
+          AIGO_DRY_RUN: ${{ vars.AIGO_DRY_RUN || '0' }}
+
+      - name: Restore plugins
+        if: always()
+        run: |
+          SETTINGS="$HOME/.claude/settings.json"
+          if [[ -f "${SETTINGS}.aigo-backup" ]]; then
+            mv "${SETTINGS}.aigo-backup" "$SETTINGS"
+          fi
