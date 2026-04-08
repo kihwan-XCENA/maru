@@ -2,6 +2,13 @@
 # Copyright 2026 XCENA Inc.
 """Maru Common - Shared types and utilities for Maru shared memory KV cache system."""
 
+from .exceptions import (  # noqa: E402
+    MaruAllocationError,
+    MaruConnectionError,
+    MaruError,
+    MaruRPCError,
+    MaruTimeoutError,
+)
 from .logging_setup import setup_package_logging  # noqa: E402
 
 setup_package_logging("maru_common")
@@ -58,6 +65,12 @@ from .serializer import Serializer, create_serializer  # noqa: E402
 __all__ = [
     # Logging
     "setup_package_logging",
+    # Exceptions
+    "MaruError",
+    "MaruConnectionError",
+    "MaruAllocationError",
+    "MaruRPCError",
+    "MaruTimeoutError",
     # Config
     "MaruConfig",
     # Pool ID constant

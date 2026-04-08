@@ -22,7 +22,13 @@ import logging
 import threading
 from collections.abc import Callable
 
-from maru_common import ANY_POOL_ID, MaruConfig
+from maru_common import (
+    ANY_POOL_ID,
+    MaruAllocationError,
+    MaruConfig,
+    MaruConnectionError,
+    MaruError,
+)
 from maru_shm import MaruHandle
 
 from .memory import (
@@ -235,7 +241,7 @@ class MaruHandler:
                         size=remaining,
                         pool_id=pool_id,
                     )
-                except Exception:
+                except (OSError, RuntimeError):
                     logger.error(
                         "RPC request_alloc failed during connect (pool_id=%s)",
                         pool_id,
@@ -255,7 +261,7 @@ class MaruHandler:
                 handle = response.handle
                 try:
                     self._owned.add_region(handle)
-                except Exception:
+                except (OSError, RuntimeError):
                     logger.error(
                         "Failed to init region from pool %s", pool_id, exc_info=True
                     )
@@ -263,7 +269,7 @@ class MaruHandler:
                         self._rpc.return_alloc(
                             self._config.instance_id, handle.region_id
                         )
-                    except Exception:
+                    except (OSError, RuntimeError):
                         logger.debug(
                             "Failed to return allocation during cleanup",
                             exc_info=True,
@@ -286,7 +292,7 @@ class MaruHandler:
                 for h in allocated_handles:
                     try:
                         self._rpc.return_alloc(self._config.instance_id, h.region_id)
-                    except Exception:
+                    except (OSError, RuntimeError):
                         logger.debug(
                             "Failed to return region %d during cleanup",
                             h.region_id,
@@ -336,7 +342,7 @@ class MaruHandler:
                 for rid in owned_region_ids:
                     try:
                         self._rpc.return_alloc(self._config.instance_id, rid)
-                    except Exception:
+                    except (OSError, RuntimeError):
                         logger.error("Failed to return region %d", rid, exc_info=True)
 
                 # 3. Unmap all regions (owned + shared) via DaxMapper
@@ -346,7 +352,7 @@ class MaruHandler:
                 # 4. Close RPC connection
                 self._rpc.close()
 
-        except Exception:
+        except (OSError, RuntimeError):
             logger.error("Error during close", exc_info=True)
 
         finally:
@@ -378,11 +384,11 @@ class MaruHandler:
 
         with self._write_lock:
             if self._closing.is_set():
-                raise RuntimeError("Handler is closing")
+                raise MaruError("Handler is closing")
 
             chunk_size = self._owned.get_chunk_size()
             if size > chunk_size:
-                raise ValueError(
+                raise MaruAllocationError(
                     f"Requested size {size} exceeds chunk_size {chunk_size}"
                 )
 
@@ -390,16 +396,16 @@ class MaruHandler:
             if result is None:
                 if not self._expand_region():
                     if not self._auto_expand:
-                        raise ValueError(
+                        raise MaruAllocationError(
                             "Cannot allocate page: pool exhausted "
                             "and auto_expand is disabled"
                         )
-                    raise ValueError(
+                    raise MaruAllocationError(
                         "Cannot allocate page: pool exhausted after expansion attempt"
                     )
                 result = self._owned.allocate()
                 if result is None:
-                    raise ValueError("Cannot allocate page after expansion")
+                    raise MaruAllocationError("Cannot allocate page after expansion")
 
             region_id, page_index = result
 
@@ -410,7 +416,7 @@ class MaruHandler:
             )
             if buf is None:
                 self._owned.free(region_id, page_index)
-                raise ValueError(f"Failed to get buffer view for region {region_id}")
+                raise MaruAllocationError(f"Failed to get buffer view for region {region_id}")
 
             handle = AllocHandle(
                 buf=buf,
@@ -483,7 +489,7 @@ class MaruHandler:
 
         with self._write_lock:
             if self._closing.is_set():
-                raise RuntimeError("Handler is closing")
+                raise MaruError("Handler is closing")
 
             # Duplicate skip
             if key in self._key_to_location:
@@ -507,7 +513,7 @@ class MaruHandler:
                     kv_offset=offset,
                     kv_length=total_size,
                 )
-            except Exception:
+            except (OSError, RuntimeError):
                 self._owned.free(region_id, page_index)
                 logger.error(
                     "store: register_kv RPC failed for key=%s, freed page (region=%d, page=%d)",
@@ -570,7 +576,7 @@ class MaruHandler:
             if self._mapper.get_region(region_id) is None:
                 try:
                     self._mapper.map_region(handle)
-                except Exception:
+                except (OSError, RuntimeError):
                     logger.error(
                         "Failed to map shared region %d", region_id, exc_info=True
                     )
@@ -649,7 +655,7 @@ class MaruHandler:
 
         with self._write_lock:
             if self._closing.is_set():
-                raise RuntimeError("Handler is closing")
+                raise MaruError("Handler is closing")
 
             # RPC first, then local free — prevents inconsistency on RPC failure
             result = self._rpc.delete_kv(key)
@@ -678,7 +684,7 @@ class MaruHandler:
 
         try:
             return self._rpc.heartbeat()
-        except Exception as e:
+        except (OSError, RuntimeError) as e:
             logger.warning("Healthcheck failed: %s", e)
             return False
 
@@ -735,7 +741,7 @@ class MaruHandler:
 
         try:
             batch_resp = self._rpc.batch_lookup_kv(keys)
-        except Exception:
+        except (OSError, RuntimeError):
             logger.error("batch_retrieve RPC failed", exc_info=True)
             return [None] * len(keys)
 
@@ -753,7 +759,7 @@ class MaruHandler:
                 if self._mapper.get_region(region_id) is None:
                     try:
                         self._mapper.map_region(handle)
-                    except Exception:
+                    except (OSError, RuntimeError):
                         logger.error(
                             "Failed to map shared region %d",
                             region_id,
@@ -821,7 +827,7 @@ class MaruHandler:
 
         with self._write_lock:
             if self._closing.is_set():
-                raise RuntimeError("Handler is closing")
+                raise MaruError("Handler is closing")
 
             chunk_size = self._owned.get_chunk_size()
             results = [True] * len(keys)
@@ -832,7 +838,7 @@ class MaruHandler:
             try:
                 exists_resp = self._rpc.batch_exists_kv(keys)
                 exists_results = exists_resp.results
-            except Exception:
+            except (OSError, RuntimeError):
                 logger.error(
                     "batch_exists RPC failed, proceeding without check", exc_info=True
                 )
@@ -872,7 +878,7 @@ class MaruHandler:
             if register_entries:
                 try:
                     batch_resp = self._rpc.batch_register_kv(register_entries)
-                except Exception:
+                except (OSError, RuntimeError):
                     logger.error("Batch register RPC failed", exc_info=True)
                     for _idx, (rid, pidx) in allocations.items():
                         self._owned.free(rid, pidx)
@@ -920,7 +926,7 @@ class MaruHandler:
 
         try:
             batch_resp = self._rpc.batch_exists_kv(keys)
-        except Exception:
+        except (OSError, RuntimeError):
             logger.error("batch_exists RPC failed", exc_info=True)
             return [False] * len(keys)
         return batch_resp.results
@@ -1013,7 +1019,7 @@ class MaruHandler:
                     size=self._expand_size,
                     pool_id=pool_id,
                 )
-            except Exception:
+            except (OSError, RuntimeError):
                 logger.error(
                     "RPC request_alloc failed during expand (pool_id=%s)",
                     pool_id,
@@ -1047,11 +1053,11 @@ class MaruHandler:
                     )
                     self._on_region_added(handle.region_id, region.allocator.page_count)
                 return True
-            except Exception:
+            except (OSError, RuntimeError):
                 logger.error("Failed to init expanded region", exc_info=True)
                 try:
                     self._rpc.return_alloc(self._config.instance_id, handle.region_id)
-                except Exception:
+                except (OSError, RuntimeError):
                     logger.debug(
                         "Failed to return allocation during expansion cleanup",
                         exc_info=True,
@@ -1072,7 +1078,7 @@ class MaruHandler:
             response = self._rpc.list_allocations(
                 exclude_instance_id=self._config.instance_id
             )
-        except Exception as e:
+        except (OSError, RuntimeError) as e:
             logger.warning("Failed to list allocations for pre-map: %s", e)
             return
 
@@ -1094,7 +1100,7 @@ class MaruHandler:
             try:
                 self._mapper.map_region(handle, prefault=False)
                 mapped_count += 1
-            except Exception as e:
+            except (OSError, RuntimeError) as e:
                 logger.warning(
                     "Failed to pre-map shared region %d: %s",
                     handle.region_id,
@@ -1110,9 +1116,9 @@ class MaruHandler:
     def _ensure_connected(self) -> None:
         """Ensure connected, raise if not or if closing."""
         if self._closing.is_set():
-            raise RuntimeError("Handler is closing")
+            raise MaruError("Handler is closing")
         if not self._connected or self._owned is None:
-            raise RuntimeError("Not connected. Call connect() first.")
+            raise MaruConnectionError("Not connected. Call connect() first.")
 
     # =========================================================================
     # Context Manager
